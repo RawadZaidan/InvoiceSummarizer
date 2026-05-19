@@ -1,20 +1,52 @@
 [
   {
     "document_type": "invoice",
-    "date": "30-09-2025",
-    "client_name": "Silk mile sal",
-    "totals": [
+    "invoice_number": "US-001",
+    "invoice_date": "2019-11-02",
+    "issued_by": {
+      "name": "East Repair Inc."
+    },
+    "billed_to": {
+      "name": "John Smith",
+      "address": "2 Court Square",
+      "city": "New York",
+      "country": "NY"
+    },
+    "line_items": [
       {
-        "amount": "5,670,000.00",
-        "currency": "LBP"
+        "description": "Front and rear brake cables",
+        "qty": 1,
+        "unit": null,
+        "unit_price": 100.0,
+        "subtotal": 100.0,
+        "tax_rate": null
       },
       {
-        "amount": "2,012.25",
-        "currency": "USD"
+        "description": "New set of pedal arms",
+        "qty": 2,
+        "unit": null,
+        "unit_price": 15.0,
+        "subtotal": 30.0,
+        "tax_rate": null
+      },
+      {
+        "description": "Labor 3hrs",
+        "qty": 3,
+        "unit": null,
+        "unit_price": 5.0,
+        "subtotal": 15.0,
+        "tax_rate": null
       }
     ],
-    "confidence": 0.98,
-    "_file": "1.pdf",
-    "_strategy": "scanned_pdf_vision"
+    "totals": {
+      "subtotal": 145.0,
+      "tax": 9.06,
+      "total": 154.06,
+      "currency": "USD"
+    },
+    "confidence": 0.99,
+    "_file": "invoice#US-001.pdf",
+    "_strategy": "scanned_pdf_vision",
+    "_elapsed_s": 5.79
   }
 ]

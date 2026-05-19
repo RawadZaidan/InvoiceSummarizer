@@ -22,6 +22,7 @@ import json
 import base64
 import re
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -50,7 +51,8 @@ if not OPENROUTER_API_KEY:
 #   "google/gemini-2.0-flash-001"            — fast, good multilingual
 #   "anthropic/claude-3.5-sonnet"             — excellent structured extraction
 #   "meta-llama/llama-3.2-90b-vision-instruct"
-VISION_MODEL = "qwen/qwen2.5-vl-72b-instruct"
+# VISION_MODEL = "qwen/qwen2.5-vl-72b-instruct"
+VISION_MODEL = "google/gemini-2.5-flash-lite"
 
 # Native-text PDFs: we try text extraction first; only call vision if
 # extracted text is suspiciously short (likely a scanned/image PDF).
@@ -72,23 +74,57 @@ Your task: analyze the provided document (image or text) and extract EXACTLY the
 Return ONLY a JSON object — no markdown, no explanation, no backticks. Example:
 {
   "document_type": "invoice",
-  "date": "2024-03-15",
-  "client_name": "شركة المستقبل للتجارة",
-  "totals": [
-    {"amount": "1,250,000 LBP", "currency": "LBP"},
-    {"amount": "14.03 USD", "currency": "USD"}
+  "invoice_number": "5987",
+  "invoice_date": "2019-01-04",
+  "issued_by": {
+    "name": "Brand Name"
+  },
+  "billed_to": {
+    "name": "Dayanne S.Clone",
+    "address": "B- Unknown Street",
+    "city": "Location",
+    "country": "Lorem Ipsum"
+  },
+  "line_items": [
+    {
+      "description": "Product Name",
+      "qty": 4,
+      "unit": null,
+      "unit_price": 50.00,
+      "subtotal": 200.00,
+      "tax_rate": null
+    }
   ],
+  "totals": {
+    "subtotal": 545.00,
+    "tax": 0.00,
+    "total": 545.00,
+    "currency": "USD"
+  },
   "confidence": 0.97
 }
 
 Field rules:
 - document_type: exactly "invoice" or "purchase_order" (use context clues like "فاتورة"/"Invoice"/"Facture" vs "أمر شراء"/"PO"/"Bon de commande")
-- date: ISO format DD-MM-YYYY when possible, or best available format; null if not found
-- client_name: the customer/buyer name (not the seller/vendor); preserve original script (Arabic if Arabic, etc.)
-- totals: list of ALL final grand totals found, with their respective currencies. If an invoice shows a total in LBP and its equivalent in USD, or even two amounts, include both.
-  - amount: the string amount as written (e.g. "1,250,000 LBP" or "14.03")
-  - currency: ISO code if identifiable (USD, LBP, EUR, SAR…); null if unclear
-- confidence: float 0.0–1.0 reflecting your extraction confidence
+- invoice_number: the invoice or PO reference number as a string; null if not found
+- invoice_date: ISO format YYYY-MM-DD when possible; null if not found
+- issued_by.name: the seller/vendor/issuer name; preserve original script; null if not found
+- billed_to.name: the customer/buyer name; preserve original script; null if not found
+- billed_to.address: street address of the buyer; null if not found
+- billed_to.city: city of the buyer; null if not found
+- billed_to.country: country of the buyer; null if not found
+- line_items: list of every line item on the document
+  - description: product or service name
+  - qty: numeric quantity; null if not present
+  - unit: unit of measure (e.g. "kg", "pcs"); null if not present
+  - unit_price: numeric unit price; null if not present
+  - subtotal: numeric line subtotal (qty × unit_price); null if not present
+  - tax_rate: tax rate as a percentage string (e.g. "11%") or null
+- totals.subtotal: numeric sum before tax; null if not found
+- totals.tax: numeric tax amount; null if not found
+- totals.total: numeric grand total; null if not found
+- totals.currency: ISO currency code of the totals (USD, LBP, EUR…); null if unclear
+- confidence: float 0.0–1.0 reflecting your overall extraction confidence
 
 If a field is genuinely not present, use null. Never guess wildly.
 """
@@ -273,9 +309,12 @@ def _parse_response(raw: str) -> dict:
     except json.JSONDecodeError:
         return {
             "document_type": None,
-            "date": None,
-            "client_name": None,
-            "totals": [],
+            "invoice_number": None,
+            "invoice_date": None,
+            "issued_by": {"name": None},
+            "billed_to": {"name": None, "address": None, "city": None, "country": None},
+            "line_items": [],
+            "totals": {"subtotal": None, "tax": None, "total": None, "currency": None},
             "confidence": 0.0,
             "_raw_response": raw,
             "_error": "Failed to parse LLM JSON response",
@@ -352,38 +391,40 @@ def process_file(file_path: str) -> dict:
     return result
 
 
+def process_file_timed(file_path: str) -> dict:
+    t0 = time.perf_counter()
+    result = process_file(file_path)
+    result["_elapsed_s"] = round(time.perf_counter() - t0, 2)
+    return result
+
+
 def _merge_page_results(results: list[dict]) -> dict:
     """
     Merge multi-page extraction results.
-    Priority: highest-confidence result wins per field.
-    Totals: Aggregate all unique currency totals found across pages (favoring the last page).
+    Priority: highest-confidence page wins for scalar fields.
+    Line items: concatenated from all pages.
+    Totals: last page with a non-null total wins (grand totals appear on the last page).
     """
     if not results:
         return {}
     if len(results) == 1:
         return results[0]
 
-    # Base from highest-confidence page
     best = max(results, key=lambda r: r.get("confidence", 0))
     merged = dict(best)
 
-    # Gather totals from all pages, favoring pages near the end if they duplicate a currency
-    all_totals_by_curr = {}
-    
-    # Process from first down to last so the last page overwrites earlier pages for the same currency
+    # Collect all line items across pages
+    all_items = []
     for r in results:
-        for t in r.get("totals", []):
-            curr = t.get("currency")
-            if curr:
-                all_totals_by_curr[curr] = t
-    
-    # Also add whatever the best page had if it didn't get caught
-    for t in merged.get("totals", []):
-        curr = t.get("currency")
-        if curr and curr not in all_totals_by_curr:
-            all_totals_by_curr[curr] = t
+        all_items.extend(r.get("line_items") or [])
+    merged["line_items"] = all_items
 
-    merged["totals"] = list(all_totals_by_curr.values())
+    # Use totals from the last page that has a non-null total value
+    for r in reversed(results):
+        t = r.get("totals") or {}
+        if t.get("total") is not None:
+            merged["totals"] = t
+            break
 
     return merged
 
@@ -392,28 +433,69 @@ def _merge_page_results(results: list[dict]) -> dict:
 # Pretty output
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _fmt(val, prefix="", suffix="") -> str:
+    if val is None:
+        return "—"
+    return f"{prefix}{val}{suffix}"
+
+
 def print_result(result: dict):
     """Print a clean, human-readable summary."""
-    sep = "─" * 52
+    sep = "─" * 60
     print(f"\n{sep}")
-    print(f"  📄  {result.get('_file', 'Unknown file')}")
+    print(f"  {result.get('_file', 'Unknown file')}")
     print(sep)
-    print(f"  Type          : {result.get('document_type') or '—'}")
-    print(f"  Date          : {result.get('date') or '—'}")
-    print(f"  Client Name   : {result.get('client_name') or '—'}")
-    
-    totals = result.get('totals') or []
-    if not totals:
-        print(f"  Totals        : —")
+
+    # Invoice Details
+    print(f"  Invoice #     : {_fmt(result.get('invoice_number'))}")
+    print(f"  Invoice Date  : {_fmt(result.get('invoice_date'))}")
+    print(f"  Type          : {_fmt(result.get('document_type'))}")
+
+    # Issued By
+    issued = result.get('issued_by') or {}
+    print(f"\n  Issued By")
+    print(f"    Name        : {_fmt(issued.get('name'))}")
+
+    # Billed To
+    billed = result.get('billed_to') or {}
+    print(f"\n  Billed To")
+    print(f"    Name        : {_fmt(billed.get('name'))}")
+    print(f"    Address     : {_fmt(billed.get('address'))}")
+    print(f"    City        : {_fmt(billed.get('city'))}")
+    print(f"    Country     : {_fmt(billed.get('country'))}")
+
+    # Line Items
+    items = result.get('line_items') or []
+    print(f"\n  Line Items ({len(items)})")
+    if items:
+        print(f"  {'#':>3}  {'Description':<24}  {'Qty':>5}  {'Unit':<6}  {'Unit Price':>10}  {'Subtotal':>10}  {'Tax Rate':>8}")
+        print(f"  {'─'*3}  {'─'*24}  {'─'*5}  {'─'*6}  {'─'*10}  {'─'*10}  {'─'*8}")
+        for i, item in enumerate(items, 1):
+            desc = str(item.get('description') or '—')[:24]
+            qty  = _fmt(item.get('qty'))
+            unit = _fmt(item.get('unit'))[:6]
+            up   = _fmt(item.get('unit_price'))
+            sub  = _fmt(item.get('subtotal'))
+            tax  = _fmt(item.get('tax_rate'))
+            print(f"  {i:>3}  {desc:<24}  {qty:>5}  {unit:<6}  {up:>10}  {sub:>10}  {tax:>8}")
     else:
-        for i, t in enumerate(totals):
-            prefix = "  Totals        :" if i == 0 else "                 "
-            print(f"{prefix} {t.get('amount')} ({t.get('currency', '—')})")
+        print(f"    (none found)")
+
+    # Totals
+    totals = result.get('totals') or {}
+    curr = totals.get('currency') or ''
+    print(f"\n  Totals")
+    print(f"    Subtotal    : {_fmt(totals.get('subtotal'))} {curr}".rstrip())
+    print(f"    Tax         : {_fmt(totals.get('tax'))} {curr}".rstrip())
+    print(f"    Total       : {_fmt(totals.get('total'))} {curr}".rstrip())
 
     conf = result.get('confidence')
     conf_str = f"{conf:.0%}" if isinstance(conf, (float, int)) else "—"
-    print(f"  Confidence    : {conf_str}")
+    elapsed = result.get('_elapsed_s')
+    elapsed_str = f"{elapsed}s" if elapsed is not None else "—"
+    print(f"\n  Confidence    : {conf_str}")
     print(f"  Strategy      : {result.get('_strategy') or '—'}")
+    print(f"  Time          : {elapsed_str}")
     if result.get("_error"):
         print(f"  ⚠ Error       : {result['_error']}")
     print(sep)
@@ -442,7 +524,7 @@ def main():
         for f in files:
             print(f"\n→ {f.name}")
             try:
-                result = process_file(str(f))
+                result = process_file_timed(str(f))
                 print_result(result)
                 all_results.append(result)
             except Exception as e:
@@ -450,7 +532,7 @@ def main():
                 all_results.append({"_file": f.name, "_error": str(e)})
     else:
         # Single file mode
-        result = process_file(str(target))
+        result = process_file_timed(str(target))
         print_result(result)
         all_results.append(result)
 
