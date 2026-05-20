@@ -101,6 +101,9 @@ Return ONLY a JSON object — no markdown, no explanation, no backticks. Example
     "total": 545.00,
     "currency": "USD"
   },
+  "payment_terms": "Net 30",
+  "notes": "Delivery within 5 business days.",
+  "terms_and_conditions": "All sales are final.",
   "confidence": 0.97
 }
 
@@ -124,6 +127,9 @@ Field rules:
 - totals.tax: numeric tax amount; null if not found
 - totals.total: numeric grand total; null if not found
 - totals.currency: ISO currency code of the totals (USD, LBP, EUR…); null if unclear
+- payment_terms: payment terms text (e.g. "Net 30", "Due on receipt", "30 jours fin de mois", "دفع فوري"); null if not found
+- notes: any free-text notes, remarks, or comments on the document not captured elsewhere; null if not found
+- terms_and_conditions: terms and conditions text printed on the document; null if not found
 - confidence: float 0.0–1.0 reflecting your overall extraction confidence
 
 If a field is genuinely not present, use null. Never guess wildly.
@@ -315,6 +321,9 @@ def _parse_response(raw: str) -> dict:
             "billed_to": {"name": None, "address": None, "city": None, "country": None},
             "line_items": [],
             "totals": {"subtotal": None, "tax": None, "total": None, "currency": None},
+            "payment_terms": None,
+            "notes": None,
+            "terms_and_conditions": None,
             "confidence": 0.0,
             "_raw_response": raw,
             "_error": "Failed to parse LLM JSON response",
@@ -488,6 +497,19 @@ def print_result(result: dict):
     print(f"    Subtotal    : {_fmt(totals.get('subtotal'))} {curr}".rstrip())
     print(f"    Tax         : {_fmt(totals.get('tax'))} {curr}".rstrip())
     print(f"    Total       : {_fmt(totals.get('total'))} {curr}".rstrip())
+
+    # Payment terms / notes / T&C
+    payment_terms = result.get('payment_terms')
+    notes = result.get('notes')
+    tandc = result.get('terms_and_conditions')
+    if payment_terms or notes or tandc:
+        print(f"\n  Payment & Terms")
+        if payment_terms:
+            print(f"    Payment Terms : {payment_terms}")
+        if notes:
+            print(f"    Notes         : {notes}")
+        if tandc:
+            print(f"    T&C           : {tandc}")
 
     conf = result.get('confidence')
     conf_str = f"{conf:.0%}" if isinstance(conf, (float, int)) else "—"
